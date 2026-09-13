@@ -1,0 +1,77 @@
+services:
+  - type: web
+    name: vin-casino
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: |
+      npm install && \
+      npm run lint && \
+      npm run typecheck && \
+      npm run build
+    startCommand: npm start
+    
+    # Environment variables
+    envVars:
+      # Node.js
+      - key: NODE_VERSION
+        value: "20"
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      
+      # Supabase (Frontend)
+      - key: VITE_SUPABASE_URL
+        sync: false  # ⚠️ Set in Render Dashboard
+      - key: VITE_SUPABASE_PUBLISHABLE_KEY
+        sync: false  # ⚠️ Set in Render Dashboard
+      
+      # Supabase (Backend - Service Role)
+      # ⚠️ CRITICAL: These grant full database access
+      - key: SUPABASE_URL
+        sync: false  # ⚠️ Set in Render Dashboard (same as VITE_SUPABASE_URL)
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false  # ⚠️ NEVER commit, set in Render Dashboard only
+      
+      # Google GenAI (Gemini)
+      # ⚠️ Billing tied to this key
+      - key: GEMINI_API_KEY
+        sync: false  # ⚠️ Set in Render Dashboard only
+      
+      # Telegram Integration (Optional)
+      # ⚠️ Exposed token can be exploited for bot hijacking
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # ⚠️ Set in Render Dashboard only
+      - key: TELEGRAM_CHAT_ID
+        sync: false  # ⚠️ Set in Render Dashboard
+      - key: TELEGRAM_BUSINESS_USERNAME
+        sync: false
+      
+      # Render-managed
+      # - RENDER_EXTERNAL_URL is auto-set by Render platform
+      # - Used for Telegram webhook & self-ping
+
+    # Health check
+    healthCheckPath: /health
+    healthCheckInterval: 30  # seconds
+    healthCheckTimeout: 10   # seconds
+
+    # Automatic restart on failure
+    maxRetries: 3
+
+# Deployment notes:
+#
+# 1. DO NOT modify or commit environment variables here
+# 2. All secrets must be set in Render Dashboard > Environment
+# 3. Use "sync: false" to prevent Render from overwriting with .env
+# 4. Pre-deployment build includes linting & type checking
+# 5. Health check monitor service availability
+#
+# Setup Instructions:
+# 1. Connect GitHub repository to Render
+# 2. Create new Web Service
+# 3. Select this render.yaml
+# 4. Set all environment variables in Render Dashboard
+# 5. Deploy
