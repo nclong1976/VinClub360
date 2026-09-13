@@ -1,0 +1,372 @@
+import React, { useState, useEffect } from "react";
+import { Link, useNavigate, useLocation } from "react-router-dom";
+import { motion } from "framer-motion";
+import { Wallet, Landmark, PenTool, ArrowRight, LogOut, Shield, Bell, HelpCircle, LayoutDashboard, CreditCard, Sparkles, FileText, Users } from "lucide-react";
+import { base44 } from "@/api/base44Client";
+import { useAuth } from "@/lib/AuthContext";
+import isAdminUser from "@/lib/isAdminUser";
+import { getCardTierInfo } from "@/lib/membershipUtils";
+import { toast } from "sonner";
+import ProfileHeader from "@/components/profile/ProfileHeader";
+import BottomNav from "@/components/BottomNav";
+import BankAccountList from "@/components/profile/BankAccountList";
+import BankAccountModal from "@/components/profile/BankAccountModal";
+import DepositModal from "@/components/profile/DepositModal";
+import WithdrawModal from "@/components/profile/WithdrawModal";
+import SecurityModal from "@/components/profile/SecurityModal";
+import PersonalInfoModal from "@/components/profile/PersonalInfoModal";
+import NotificationModal from "@/components/profile/NotificationModal";
+import AppRulesModal from "@/components/profile/AppRulesModal";
+import TransactionList from "@/components/profile/TransactionList";
+import WalletTransactionList from "@/components/profile/WalletTransactionList";
+import SignatureList from "@/components/profile/SignatureList";
+import AccountSwitcherModal from "@/components/profile/AccountSwitcherModal";
+import { computeWalletNet } from "@/lib/transactionHistory";
+import { useWithdrawalSync } from "@/hooks/useWithdrawalSync";
+
+const fmtVnd = (n) => (n || 0).toLocaleString("vi-VN");
+
+export default function Profile() {
+  const { user, refreshUser } = useAuth();
+  const navigate = useNavigate();
+
+  const [txs, setTxs] = useState([]);
+  const [walletTxs, setWalletTxs] = useState([]);
+  const [sigs, setSigs] = useState([]);
+  const [banks, setBanks] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("wallet");
+
+  const [showBankModal, setShowBankModal] = useState(false);
+  const [showDeposit, setShowDeposit] = useState(false);
+  const [showWithdraw, setShowWithdraw] = useState(false);
+  const [showSecurity, setShowSecurity] = useState(false);
+  const [showNotification, setShowNotification] = useState(false);
+  const [showRules, setShowRules] = useState(false);
+  const [showAccountSwitcher, setShowAccountSwitcher] = useState(false);
+  const [showPersonalInfo, setShowPersonalInfo] = useState(false);
+
+  const fetchData = async () => {
+    const me = user || (await base44.auth.me().catch(() => null));
+    if (!me) {
+      setLoading(false);
+      return;
+    }
+    const [t, wt, s, b] = await Promise.all([
+      base44.entities.Transaction.filter({ user_id: me.id }, "-created_date", 50).catch(() => []),
+      base44.entities.WalletTransaction.filter(
+        { $or: [{ user_id: me.id }, { created_by_id: me.id }] },
+        "-created_date",
+        50
+      ).catch(() => []),
+      base44.entities.Signature.filter({ user_id: me.id }, "-created_date", 20).catch(() => []),
+      base44.entities.BankAccount.filter({
+        $or: [
+          { user_id: me.id },
+          { created_by_id: me.id },
+          { user_email: me.email }
+        ]
+      }, "-created_date", 50).catch(() => []),
+    ]);
+
+    let finalBanks = b;
+    // Fallback 1: check user.bank_accounts array on user object
+    if ((!finalBanks || finalBanks.length === 0) && Array.isArray(me.bank_accounts) && me.bank_accounts.length > 0) {
+      finalBanks = me.bank_accounts;
+    }
+    // Fallback 2: check direct bank_name / account_number fields
+    if ((!finalBanks || finalBanks.length === 0) && me.bank_name && me.account_number) {
+      finalBanks = [{
+        id: 'user_bank_' + me.id,
+        bank_name: me.bank_name,
+        bank_code: me.bank_code || 'BK',
+        account_number: me.account_number,
+        account_holder: me.account_holder || me.full_name || me.name,
+        is_default: true
+      }];
+    }
+    // Fallback 3: check localStorage entity store for any bank accounts matching me.id or me.email
+    if (!finalBanks || finalBanks.length === 0) {
+      try {
+        const rawStore = localStorage.getItem("base44_entity_BankAccount");
+        if (rawStore) {
+          const parsed = JSON.parse(rawStore);
+          if (Array.isArray(parsed)) {
+            const matched = parsed.filter(item => 
+              item.user_id === me.id || 
+              item.created_by_id === me.id || 
+              item.user_email === me.email ||
+              !item.user_id
+            );
+            if (matched.length > 0) finalBanks = matched;
+          }
+        }
+      } catch (e) {}
+    }
+
+    setTxs(t);
+    setWalletTxs(wt);
+    setSigs(s);
+    setBanks(finalBanks || []);
+    setLoading(false);
+
+    // Supabase là nguồn sự thật duy nhất cho balance/total_deposited (xem
+    // whimsical-napping-floyd.md Bước 5) - KHÔNG tự ghi đè ở đây nữa. Trước
+    // đây khối này gọi updateUserBalance() (cộng dồn total_deposited) mỗi
+    // lần tải trang dựa trên tối đa 50 giao dịch gần nhất, đây chính là cơ
+    // chế gây lãi/tổng nạp phình to không kiểm soát khi bị kích hoạt lặp lại.
+    // Giờ chỉ cảnh báo console nếu phát hiện lệch, dùng TOÀN BỘ lịch sử ví
+    // (không giới hạn 50) để việc so sánh chính xác. Điều chỉnh dữ liệu lệch
+    // thật sự phải qua công cụ admin (setAbsoluteUserBalanceAndDeposit), có
+    // chủ đích, có thể theo dõi được.
+    base44.entities.WalletTransaction.filter(
+      { $or: [{ user_id: me.id }, { created_by_id: me.id }] },
+      "-created_date"
+    ).then((fullWt) => {
+      const { depSum, netCalculated } = computeWalletNet(fullWt);
+      const driftBalance = netCalculated - Number(me.balance || 0);
+      const driftDeposit = depSum - Number(me.total_deposited || 0);
+      if (Math.abs(driftBalance) > 1 || Math.abs(driftDeposit) > 1) {
+        console.warn(
+          `[Profile] Lệch số dư (chỉ cảnh báo, không tự ghi đè) - user=${me.id}: ` +
+          `balance Supabase=${me.balance} vs tính từ lịch sử ví=${netCalculated} (lệch ${driftBalance}); ` +
+          `total_deposited Supabase=${me.total_deposited} vs tính từ lịch sử ví=${depSum} (lệch ${driftDeposit})`
+        );
+      }
+    }).catch(() => {});
+  };
+
+  const location = useLocation();
+
+  // Realtime: Admin duyệt/từ chối rút tiền -> patch trực tiếp vào walletTxs
+  // (không đợi fetchData() refetch toàn bộ) + Toast thông báo ngay lập tức
+  useWithdrawalSync(user?.id, setWalletTxs, (updated) => {
+    if (updated.status === "completed") {
+      toast.success(`Giao dịch rút ${fmtVnd(updated.amount)} VNĐ đã thành công`);
+    } else if (updated.status === "rejected") {
+      toast.error(`Giao dịch rút ${fmtVnd(updated.amount)} VNĐ đã bị từ chối`);
+    }
+  });
+
+  useEffect(() => {
+    fetchData();
+
+    // Auto-open deposit modal if redirected with deposit=true or action=deposit
+    const params = new URLSearchParams(location.search);
+    if (params.get("deposit") === "true" || params.get("action") === "deposit") {
+      setShowDeposit(true);
+    }
+    if (params.get("action") === "withdraw") {
+      setShowWithdraw(true);
+    }
+
+    const handleDataUpdate = () => {
+      fetchData();
+      if (refreshUser) refreshUser();
+    };
+    window.addEventListener("vinclub:balance_updated", handleDataUpdate);
+    window.addEventListener("vinclub:bank_updated", handleDataUpdate);
+
+    // Đăng ký realtime cho lịch sử giao dịch: khi Admin duyệt/từ chối một
+    // lệnh rút, Firestore đẩy cập nhật về và gọi notifySubscribers() ở đây
+    const unsubWalletTx = base44.entities.WalletTransaction.subscribe(() => fetchData());
+
+    // Trước đây trang này CHỈ subscribe WalletTransaction - "vinclub:bank_
+    // updated" ở trên chỉ là CustomEvent nội bộ cùng 1 tab (do
+    // BankAccountModal.jsx tự dispatch khi CHÍNH người dùng tự liên kết ngân
+    // hàng), không bắn được sang thiết bị/tab khác. Khi Admin tự thêm/xóa
+    // tài khoản ngân hàng thay hội viên (UserDetailModal.jsx) hoặc duyệt/từ
+    // chối 1 hợp đồng đầu tư (ContractsTab.jsx, sửa bảng Transaction) trên
+    // MỘT thiết bị khác, trang Hồ sơ của chính người dùng đó (thiết bị của
+    // họ) không hề hay biết cho tới khi tự tải lại trang - đúng yêu cầu "tự
+    // động cập nhật, không cần tải lại trang".
+    const unsubTx = base44.entities.Transaction.subscribe(() => fetchData());
+    const unsubBank = base44.entities.BankAccount.subscribe(() => fetchData());
+
+    return () => {
+      window.removeEventListener("vinclub:balance_updated", handleDataUpdate);
+      window.removeEventListener("vinclub:bank_updated", handleDataUpdate);
+      unsubWalletTx();
+      unsubTx();
+      unsubBank();
+    };
+  }, [user, location.search]);
+
+  const { depSum: depositSumFromTxs, netCalculated: netCalculatedBalance } = computeWalletNet(walletTxs);
+  const currentBalance = Math.max(Number(user?.balance || 0), netCalculatedBalance);
+
+  const totalDepositSum = Math.max(Number(user?.total_deposited || 0), depositSumFromTxs);
+  const userTier = getCardTierInfo(user?.membership_tier);
+
+  const displayName = user?.full_name || user?.name || user?.username || user?.email || "KHÁCH HÀNG";
+  const avatarLetter = (displayName.trim().charAt(0) || "N").toUpperCase();
+  const phoneOrEmail = user?.phone || user?.email || "Chưa cập nhật SĐT";
+  const isUserAdmin = isAdminUser(user);
+
+  const settingsItems = [
+    ...(isUserAdmin
+      ? [{ icon: LayoutDashboard, label: "Bảng quản trị Admin", color: "text-[#948154]", link: "/admin" }]
+      : []),
+    { icon: Users, label: "Chuyển đổi tài khoản", color: "text-[#948154]", onClick: () => setShowAccountSwitcher(true) },
+    { icon: FileText, label: "Quy định & Thể lệ VinClub", color: "text-[#948154]", onClick: () => setShowRules(true) },
+    { icon: Shield, label: "Bảo mật & Mã PIN", color: "text-blue-500", onClick: () => setShowSecurity(true) },
+    { icon: Bell, label: "Thông báo biến động", color: "text-orange-500", onClick: () => setShowNotification(true) },
+    { icon: CreditCard, label: "Thẻ thành viên VIP", color: "text-[#948154]", link: "/card" },
+    { icon: HelpCircle, label: "Hỗ trợ & Chăm sóc KH", color: "text-green-500", link: "/support" },
+  ];
+
+  const handleLogout = async () => {
+    await base44.auth.logout();
+    toast.success("Đã đăng xuất tài khoản");
+    window.location.href = "/login";
+  };
+
+  return (
+    <main className="relative w-full min-h-screen bg-[#f5f5f5] overflow-x-hidden font-heading">
+      <ProfileHeader />
+      <div className="max-w-4xl mx-auto px-4 py-4 pb-24 space-y-4">
+        {/* Profile Card / User Header */}
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-white rounded-2xl p-4 shadow-sm relative overflow-hidden"
+        >
+          <button
+            onClick={() => setShowPersonalInfo(true)}
+            className="flex items-center gap-3 w-full text-left cursor-pointer"
+          >
+            <div className="w-13 h-13 w-[52px] h-[52px] rounded-full bg-gradient-to-br from-[#948154] to-[#6b5e3e] text-white flex items-center justify-center text-[20px] font-bold shadow-md shrink-0">
+              {avatarLetter}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-[14px] font-bold text-black truncate uppercase tracking-wide">
+                {displayName}
+              </p>
+              <p className="text-[11px] text-gray-500 truncate">{phoneOrEmail}</p>
+              <span
+                className="inline-flex items-center gap-1 mt-1 px-2.5 py-0.5 rounded-full bg-[#948154]/10 text-[#948154] text-[9px] font-bold tracking-wider"
+              >
+                <Sparkles className="w-2.5 h-2.5" />
+                {user?.role === "admin" ? "QUẢN TRỊ VIÊN VIP" : userTier.fullName.toUpperCase()}
+              </span>
+            </div>
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowAccountSwitcher(true);
+              }}
+              className="w-8 h-8 rounded-full bg-gray-50 hover:bg-gray-100 text-gray-500 flex items-center justify-center shrink-0 border border-gray-100"
+              title="Chuyển đổi tài khoản"
+            >
+              <Users className="w-3.5 h-3.5" />
+            </span>
+          </button>
+        </motion.div>
+
+        {/* Bank Accounts Management */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-[13px] font-bold text-black flex items-center gap-1.5">
+              <Landmark className="w-4 h-4 text-[#948154]" /> Tài khoản ngân hàng
+            </h2>
+          </div>
+          <BankAccountList
+            accounts={banks}
+            loading={loading}
+            onAdd={() => setShowBankModal(true)}
+          />
+        </div>
+
+        {/* Transaction History Filter Tabs */}
+        <div>
+          <h2 className="text-[13px] font-bold text-black mb-2 flex items-center gap-1.5">
+            <Wallet className="w-4 h-4 text-[#948154]" /> Lịch sử giao dịch
+          </h2>
+          <div className="flex gap-1 bg-white rounded-xl p-1 shadow-sm mb-2">
+            <button
+              onClick={() => setTab("wallet")}
+              className={`flex-1 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
+                tab === "wallet" ? "bg-[#948154] text-white shadow-sm" : "text-gray-400"
+              }`}
+            >
+              Giao dịch ví (Nạp/Rút)
+            </button>
+            <button
+              onClick={() => setTab("invest")}
+              className={`flex-1 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
+                tab === "invest" ? "bg-[#948154] text-white shadow-sm" : "text-gray-400"
+              }`}
+            >
+              Đầu tư (Hợp đồng)
+            </button>
+          </div>
+          {tab === "wallet" ? (
+            <WalletTransactionList items={walletTxs} loading={loading} currentBalance={currentBalance} />
+          ) : (
+            <TransactionList txs={txs} loading={loading} />
+          )}
+        </div>
+
+        {/* Digital Signature Management */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-[13px] font-bold text-black flex items-center gap-1.5">
+              <PenTool className="w-4 h-4 text-[#948154]" /> Chữ ký điện tử
+            </h2>
+            <Link to="/signature" className="text-[11px] text-[#948154] font-medium flex items-center gap-0.5">
+              Tạo/Quản lý <ArrowRight className="w-3 h-3" />
+            </Link>
+          </div>
+          <SignatureList sigs={sigs} loading={loading} />
+        </div>
+
+        {/* Settings & Security */}
+        <div className="bg-white rounded-2xl shadow-sm overflow-hidden">
+          {settingsItems.map((item, i) => {
+            const inner = (
+              <>
+                <item.icon className={`w-4 h-4 ${item.color}`} />
+                <span className="text-[12px] font-medium text-gray-700 flex-1 text-left">{item.label}</span>
+                <ArrowRight className="w-3 h-3 text-gray-300" />
+              </>
+            );
+            const cls = `w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-50 active:bg-gray-100 transition-colors ${
+              i < settingsItems.length - 1 ? "border-b border-gray-50" : ""
+            }`;
+            return item.link ? (
+              <Link key={i} to={item.link} className={cls}>{inner}</Link>
+            ) : (
+              <button key={i} onClick={item.onClick} className={cls}>{inner}</button>
+            );
+          })}
+        </div>
+
+        <button
+          onClick={handleLogout}
+          className="w-full py-2.5 rounded-xl border border-red-100 bg-white text-[12px] font-medium text-red-500 flex items-center justify-center gap-2 hover:bg-red-50 active:scale-95 transition-all shadow-sm"
+        >
+          <LogOut className="w-4 h-4" /> Đăng xuất tài khoản
+        </button>
+      </div>
+
+      {/* Modals */}
+      <BankAccountModal open={showBankModal} onClose={() => setShowBankModal(false)} onSaved={fetchData} />
+      <DepositModal open={showDeposit} onClose={() => setShowDeposit(false)} banks={banks} onDone={fetchData} />
+      <WithdrawModal
+        open={showWithdraw}
+        onClose={() => setShowWithdraw(false)}
+        banks={banks}
+        balance={currentBalance}
+        onDone={fetchData}
+        onAddBank={() => setShowBankModal(true)}
+      />
+      <SecurityModal open={showSecurity} onClose={() => setShowSecurity(false)} />
+      <NotificationModal open={showNotification} onClose={() => setShowNotification(false)} />
+      <AppRulesModal open={showRules} onClose={() => setShowRules(false)} />
+      <AccountSwitcherModal open={showAccountSwitcher} onClose={() => setShowAccountSwitcher(false)} />
+      <PersonalInfoModal open={showPersonalInfo} onClose={() => setShowPersonalInfo(false)} />
+
+      <BottomNav />
+    </main>
+  );
+}

@@ -1,0 +1,335 @@
+import React, { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
+import { Bell, X, Clock } from "lucide-react";
+import { base44 } from "@/api/base44Client";
+import { useAuth } from "@/lib/AuthContext";
+import { getProjectTermUnit, getProjectTermDurationDisplayValue, formatScheduleTime, isDailyAccrualCategory, getCycleDays, formatDailyRatePercent } from "@/lib/investmentTerms";
+import NotificationDetailModal from "@/components/home/NotificationDetailModal";
+
+const TYPE_LABELS = {
+  deposit: { label: "Nạp tiền", color: "text-green-500", bg: "bg-green-50" },
+  withdraw: { label: "Rút tiền", color: "text-orange-500", bg: "bg-orange-50" },
+  contract: { label: "Hợp đồng", color: "text-[#948154]", bg: "bg-[#948154]/10" },
+  wallet: { label: "Ví", color: "text-blue-500", bg: "bg-blue-50" },
+  admin: { label: "Thông báo", color: "text-orange-500", bg: "bg-orange-50" },
+  project: { label: "Dự án", color: "text-blue-500", bg: "bg-blue-50" },
+};
+
+// Khớp đúng route từng category trong src/App.jsx - xác nhận qua filter
+// category thật trong từng trang (Projects.jsx="Dự Án", LandInvestment.jsx=
+// "VinHomes", Resort.jsx="Đầu tư nghỉ dưỡng", Stocks.jsx="Đầu tư chứng khoán").
+const CATEGORY_ROUTES = {
+  "Dự Án": "/projects",
+  "VinHomes": "/land",
+  "Đầu tư nghỉ dưỡng": "/resort",
+  "Đầu tư chứng khoán": "/stocks",
+};
+
+function timeAgo(dateStr) {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "Vừa xong";
+  if (m < 60) return `${m} phút trước`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} giờ trước`;
+  const d = Math.floor(h / 24);
+  return `${d} ngày trước`;
+}
+
+// Mọi thông báo hiển thị ở chuông này (broadcast toàn hệ thống hoặc broadcast
+// admin) đều là 1 dòng DUY NHẤT được CHIA SẺ giữa tất cả người xem - không có
+// user_id riêng. Nếu dùng field is_read trên chính dòng đó, một người bấm
+// đọc sẽ tắt luôn dấu "mới" cho MỌI người khác (Postgres UPDATE 1 dòng, phát
+// qua Realtime tới mọi client). Nên trạng thái "đã đọc" của TỪNG người phải
+// theo dõi CỤC BỘ (localStorage riêng theo user.id), không ghi lên dòng DB.
+const readKey = (userId) => `vinclub_read_broadcast_notifs_${userId}`;
+
+function getReadSet(userId) {
+  try {
+    const raw = localStorage.getItem(readKey(userId));
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function saveReadSet(userId, set) {
+  try {
+    localStorage.setItem(readKey(userId), JSON.stringify([...set]));
+  } catch (e) {}
+}
+
+export default function NotificationBell() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const [notifs, setNotifs] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [selected, setSelected] = useState(null);
+  const ref = useRef(null);
+
+  const fetchNotifs = () => {
+    if (!user) return;
+    base44.entities.Notification
+      .list("-created_date", 50)
+      .then((list) => {
+        // Chuông thông báo hiển thị: tin CHUNG toàn hệ thống (không gắn
+        // user_id), broadcast tới admin ("admin" là giá trị đặc biệt, không
+        // phải id thật), VÀ tin riêng của chính tài khoản này (n.user_id ===
+        // user.id) - nhóm cuối này trước đây bị loại hẳn khỏi chuông (mọi
+        // thông tin gắn 1 tài khoản đều đẩy vào khung chat CSKH, xem
+        // lib/notifyUser.js), nhưng riêng 2 thông báo rút tiền ("đang chờ
+        // phê duyệt" và "Biến động số dư") giờ được tạo thẳng vào bảng
+        // notifications theo user_id để hiện ở đây thay vì làm loãng khung
+        // chat thật với CSKH.
+        const readSet = getReadSet(user.id);
+        const userNotifs = (list || [])
+          .filter(n => !n.user_id || n.user_id === user.id || (n.user_id === "admin" && user.role === "admin"))
+          .map(n => ({ ...n, is_read: readSet.has(n.id) }));
+        setNotifs(userNotifs);
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    if (user) {
+      fetchNotifs();
+      const unsub = base44.entities.Notification.subscribe(() => fetchNotifs());
+
+      const handleBalanceUpdate = () => fetchNotifs();
+      window.addEventListener("vinclub:balance_updated", handleBalanceUpdate);
+
+      // Poll dự phòng - CÙNG lý do đã thêm cho khung chat CSKH (Support.jsx):
+      // subscribe() ở trên là kênh chính, nhưng nếu lượt fetchNotifs() lúc
+      // mount thất bại (mạng chập chờn đúng lúc mở trang) HOẶC kênh Realtime
+      // rớt rồi tự kết nối lại (subscribeChannelWithAutoReconnect) mà không
+      // có thay đổi Postgres mới nào xảy ra SAU khi kết nối lại, callback ở
+      // subscribe() không có gì để bắn - chuông kẹt ở trạng thái trống/cũ
+      // vĩnh viễn trên đúng thiết bị đó tới khi người dùng tự tải lại trang,
+      // dù dữ liệu/quyền phía server hoàn toàn đúng. 20s là đủ nhẹ cho 1
+      // component hiện diện trên mọi trang, không cần nhanh như chat.
+      const pollInterval = setInterval(fetchNotifs, 20000);
+
+      return () => {
+        unsub();
+        window.removeEventListener("vinclub:balance_updated", handleBalanceUpdate);
+        clearInterval(pollInterval);
+      };
+    }
+  }, [user]);
+
+  useEffect(() => {
+    const handler = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const unread = notifs.filter((n) => !n.is_read).length;
+
+  const markAllRead = () => {
+    const unreadList = notifs.filter((n) => !n.is_read);
+    if (unreadList.length === 0) return;
+    const readSet = getReadSet(user.id);
+    unreadList.forEach((n) => readSet.add(n.id));
+    saveReadSet(user.id, readSet);
+    fetchNotifs();
+  };
+
+  const markRead = (n) => {
+    if (n.is_read) return;
+    const readSet = getReadSet(user.id);
+    readSet.add(n.id);
+    saveReadSet(user.id, readSet);
+    fetchNotifs();
+  };
+
+  const handleNotifClick = (n) => {
+    markRead(n);
+    if (n.type === "project" && n.extra?.project_id) {
+      const route = CATEGORY_ROUTES[n.extra.project_category] || "/projects";
+      setOpen(false);
+      navigate(`${route}?highlight=${n.extra.project_id}`);
+      return;
+    }
+    // Thông báo thường (title/content) trước đây bấm vào không có tác dụng
+    // gì ngoài đánh dấu đã đọc, và trong popup chỉ hiện tối đa 2 dòng nội
+    // dung (line-clamp-2 bên dưới) - mở modal để đọc trọn vẹn.
+    setOpen(false);
+    setSelected(n);
+  };
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="p-1 -m-1 transition-opacity hover:opacity-80 active:scale-95 relative"
+      >
+        <img
+          className="w-3.5 h-4 object-contain"
+          src="https://media.base44.com/images/public/6a37d9fdaf7a9d14d5fd8c01/dfe1d99ce_63395f89e_94bc0a06ce8c2d0050dd667426523002cd25fb3c.png"
+          alt="Notifications"
+        />
+        {unread > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 min-w-[13px] h-[13px] px-0.5 rounded-full bg-red-500 text-white text-[7px] font-bold flex items-center justify-center">
+            {unread > 9 ? "9+" : unread}
+          </span>
+        )}
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -8, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -8, scale: 0.95 }}
+            transition={{ type: "spring", stiffness: 400, damping: 30 }}
+            className="absolute right-0 top-full mt-2 w-[280px] bg-white rounded-2xl shadow-xl border border-gray-100 z-50 overflow-hidden"
+          >
+            <div className="flex items-center justify-between px-3 py-2.5 border-b border-gray-100">
+              <div className="flex items-center gap-1.5">
+                <Bell className="w-3.5 h-3.5 text-[#948154]" />
+                <span className="text-[12px] font-bold text-black">Thông báo</span>
+                {unread > 0 && (
+                  <span className="text-[9px] text-gray-400">({unread} mới)</span>
+                )}
+              </div>
+              <div className="flex items-center gap-1">
+                {unread > 0 && (
+                  <button
+                    onClick={markAllRead}
+                    className="text-[9px] text-[#948154] font-medium hover:underline"
+                  >
+                    Đọc tất cả
+                  </button>
+                )}
+                <button
+                  onClick={() => setOpen(false)}
+                  className="w-5 h-5 flex items-center justify-center rounded-full hover:bg-gray-100"
+                >
+                  <X className="w-3 h-3 text-gray-400" />
+                </button>
+              </div>
+            </div>
+
+            <div className="max-h-[320px] overflow-y-auto">
+              {loading ? (
+                <div className="text-center py-6 text-[11px] text-gray-400">Đang tải...</div>
+              ) : notifs.length === 0 ? (
+                <div className="text-center py-6">
+                  <Bell className="w-6 h-6 text-gray-200 mx-auto mb-1.5" />
+                  <p className="text-[11px] text-gray-400">Chưa có thông báo</p>
+                </div>
+              ) : (
+                notifs.map((n) => {
+                  const tc = TYPE_LABELS[n.type] || TYPE_LABELS.admin;
+                  const isProjectCard = n.type === "project" && n.extra?.project_id;
+
+                  if (isProjectCard) {
+                    const termUnit = getProjectTermUnit({ category: n.extra.project_category });
+                    const termValue = getProjectTermDurationDisplayValue({
+                      category: n.extra.project_category,
+                      term_duration_minutes: n.extra.project_duration_minutes,
+                    });
+                    const minAmount = Number(n.extra.project_min_amount) || 0;
+                    const openTime = formatScheduleTime(n.extra.project_open_at);
+                    const closeTime = formatScheduleTime(n.extra.project_close_at);
+                    return (
+                      <button
+                        key={n.id}
+                        onClick={() => handleNotifClick(n)}
+                        className={`w-full text-left px-3 py-2.5 border-b border-gray-50 hover:bg-gray-50 transition ${
+                          !n.is_read ? "bg-[#948154]/5" : ""
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className={`text-[8px] font-semibold ${tc.color}`}>{tc.label}</span>
+                          <span className="text-[8px] text-gray-300">·</span>
+                          <span className="text-[8px] text-gray-400">{timeAgo(n.created_date)}</span>
+                          {!n.is_read && (
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-500 ml-auto shrink-0" />
+                          )}
+                        </div>
+                        {n.image && (
+                          <img src={n.image} alt="" className="w-full h-20 rounded-lg object-cover mb-1.5" />
+                        )}
+                        <p className="text-[11px] font-semibold text-black leading-tight mb-1">{n.title}</p>
+                        {openTime && closeTime && (
+                          <p className="flex items-center gap-1 text-[9.5px] font-semibold text-[#948154] mb-1">
+                            <Clock className="w-2.5 h-2.5" /> Mở đầu tư: {openTime} - {closeTime}
+                          </p>
+                        )}
+                        <div className="grid grid-cols-3 gap-1 bg-gray-50 rounded-lg p-1.5">
+                          <div className="text-center">
+                            <p className="text-[10px] font-black text-[#948154]">{n.extra.project_rate ? `${n.extra.project_rate}%` : "-"}</p>
+                            <p className="text-[7px] text-gray-400">Lãi suất</p>
+                            {n.extra.project_rate && isDailyAccrualCategory(n.extra.project_category) && (
+                              <p className="text-[6.5px] text-gray-400">
+                                ~{formatDailyRatePercent(n.extra.project_rate, getCycleDays({ term_duration_minutes: n.extra.project_duration_minutes }))}
+                              </p>
+                            )}
+                          </div>
+                          <div className="text-center border-x border-gray-200">
+                            <p className="text-[10px] font-black text-[#948154]">{termValue} {termUnit}</p>
+                            <p className="text-[7px] text-gray-400">Kỳ hạn</p>
+                          </div>
+                          <div className="text-center">
+                            <p className="text-[10px] font-black text-[#948154]">{minAmount ? minAmount.toLocaleString("vi-VN") : "-"}</p>
+                            <p className="text-[7px] text-gray-400">Tối thiểu</p>
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  }
+
+                  return (
+                    <button
+                      key={n.id}
+                      onClick={() => handleNotifClick(n)}
+                      className={`w-full text-left flex gap-2.5 px-3 py-2.5 border-b border-gray-50 hover:bg-gray-50 transition ${
+                        !n.is_read ? "bg-[#948154]/5" : ""
+                      }`}
+                    >
+                      {n.image ? (
+                        <img
+                          src={n.image}
+                          alt=""
+                          className="w-9 h-9 rounded-lg object-cover shrink-0"
+                        />
+                      ) : (
+                        <span className={`w-9 h-9 rounded-lg ${tc.bg} flex items-center justify-center shrink-0`}>
+                          <Bell className={`w-4 h-4 ${tc.color}`} />
+                        </span>
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5 mb-0.5">
+                          <span className={`text-[8px] font-semibold ${tc.color}`}>{tc.label}</span>
+                          <span className="text-[8px] text-gray-300">·</span>
+                          <span className="text-[8px] text-gray-400">{timeAgo(n.created_date)}</span>
+                          {!n.is_read && (
+                            <span className="w-1.5 h-1.5 rounded-full bg-red-500 ml-auto shrink-0" />
+                          )}
+                        </div>
+                        <p className="text-[11px] font-semibold text-black leading-tight truncate">
+                          {n.title}
+                        </p>
+                        <p className="text-[10px] text-gray-400 leading-snug line-clamp-2">
+                          {n.content}
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <NotificationDetailModal notif={selected} onClose={() => setSelected(null)} />
+    </div>
+  );
+}

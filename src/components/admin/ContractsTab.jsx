@@ -1,0 +1,220 @@
+import React, { useState, useEffect } from "react";
+import { motion } from "framer-motion";
+import { Check, X, FileSignature } from "lucide-react";
+import { base44 } from "@/api/base44Client";
+import { notifyUser } from "@/lib/notifyUser";
+import { toast } from "sonner";
+import { formatDailyRatePercent } from "@/lib/investmentTerms";
+
+const fmt = (n) => (n || 0).toLocaleString("vi-VN");
+
+const STATUS_CONFIG = {
+  pending: { label: "Chờ duyệt", color: "bg-orange-100 text-orange-600" },
+  approved: { label: "Đã duyệt", color: "bg-green-100 text-green-600" },
+  rejected: { label: "Từ chối", color: "bg-red-100 text-red-600" },
+};
+
+export default function ContractsTab() {
+  const [txs, setTxs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("pending");
+  // Chặn click đúp / double-submit trong lúc đang chờ update() - không có
+  // khoá phía server (contract_status không phải tiền, chỉ là trạng thái
+  // hiển thị) nên khoá client-side là đủ để tránh gửi trùng notifyUser.
+  const [processingId, setProcessingId] = useState(null);
+
+  const fetch = () => {
+    base44.entities.Transaction
+      .filter({ signature_content: { $exists: true } }, "-created_date", 50)
+      .then(setTxs)
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetch();
+
+    // Đăng ký realtime: trước đây tab này chỉ tải 1 lần lúc mount, không có
+    // subscribe nào nên hợp đồng mới từ thiết bị khác không hiện ra cho tới
+    // khi Admin tự tải lại trang. base44Client.js giờ phát thẳng dữ liệu
+    // Transaction vừa đổi trên Postgres (payload thật, không debounce/refetch
+    // REST) - áp thẳng freshItems (lọc + sắp xếp + giới hạn đúng như fetch()
+    // ở trên) thay vì tự fetch() lại REST mỗi lần, loại bỏ 1 round-trip thừa
+    // cộng thêm độ trễ mỗi khi có hợp đồng mới/vừa được ký/duyệt.
+    const unsub = base44.entities.Transaction.subscribe((freshItems) => {
+      if (!Array.isArray(freshItems)) {
+        fetch();
+        return;
+      }
+      const filtered = freshItems
+        .filter((t) => t.signature_content !== undefined && t.signature_content !== null && t.signature_content !== "")
+        .sort((a, b) => new Date(b.created_date || 0) - new Date(a.created_date || 0))
+        .slice(0, 50);
+      setTxs(filtered);
+      setLoading(false);
+    });
+
+    return () => {
+      unsub();
+    };
+  }, []);
+
+  const handleAction = async (tx, action) => {
+    // Idempotency: chặn double-click và race giữa 2 tab admin - nếu hợp
+    // đồng đã được xử lý (không còn "pending") thì bỏ qua, không gửi
+    // notifyUser trùng lặp cho người dùng.
+    if (processingId || (tx.contract_status || "pending") !== "pending") return;
+    setProcessingId(tx.id);
+    try {
+      const result = await base44.entities.Transaction.update(tx.id, { contract_status: action });
+      if (result?.__supabaseSynced === false) {
+        toast.error("Ghi lên máy chủ thất bại, vui lòng thử lại (trạng thái có thể chưa được lưu).");
+        return;
+      }
+      if (tx.user_id) {
+        // Trước đây chỉ báo khi DUYỆT - hợp đồng bị TỪ CHỐI không thông báo
+        // gì cho người dùng, họ chỉ biết khi tự vào lại xem danh sách.
+        await notifyUser(tx.user_id, action === "approved"
+          ? {
+              title: "Hợp đồng đã được duyệt",
+              content: `Dạ hợp đồng đầu tư "${tx.project_title}" (${(tx.amount || 0).toLocaleString("vi-VN")} VNĐ) của Quý khách đã được duyệt thành công. Tổng nhận dự kiến: ${(tx.total || 0).toLocaleString("vi-VN")} VNĐ. Cảm ơn Quý khách đã tin tưởng đồng hành cùng VinClub!`,
+              type: "contract",
+            }
+          : {
+              title: "Hợp đồng bị từ chối",
+              content: `Dạ rất tiếc, hợp đồng đầu tư "${tx.project_title}" (${(tx.amount || 0).toLocaleString("vi-VN")} VNĐ) của Quý khách chưa thể được duyệt. Quý khách vui lòng liên hệ CSKH để được hỗ trợ thêm ạ.`,
+              type: "contract",
+            });
+      }
+      toast.success(action === "approved" ? "Đã duyệt hợp đồng" : "Đã từ chối hợp đồng");
+      // Không cần fetch() lại REST ở đây nữa: base44.entities.Transaction.
+      // update() ở trên đã tự phát (notifySubscribers) bản ghi vừa cập nhật
+      // cho chính subscribe() callback đăng ký ở trên NGAY LẬP TỨC (trước cả
+      // khi await ở trên trả về) - fetch() thêm 1 lần nữa chỉ lặp lại đúng
+      // việc đó qua 1 round-trip REST thừa.
+    } catch (e) {
+      toast.error("Không thể cập nhật");
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
+  const filtered = txs.filter((t) => {
+    const status = t.contract_status || "pending";
+    return filter === "all" || status === filter;
+  });
+
+  if (loading)
+    return <div className="text-center py-8 text-[13px] text-gray-400">Đang tải...</div>;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-2">
+        {["pending", "approved", "rejected", "all"].map((f) => (
+          <button
+            key={f}
+            onClick={() => setFilter(f)}
+            className={`relative px-3 py-1.5 rounded-lg text-[11px] font-medium transition-colors cursor-pointer ${
+              filter === f ? "text-white" : "bg-white text-gray-400 shadow-sm"
+            }`}
+          >
+            {filter === f && (
+              <motion.span
+                layoutId="contracts-filter-active-bg"
+                className="absolute inset-0 bg-[#948154] rounded-lg"
+                transition={{ type: "spring", duration: 0.35, bounce: 0.15 }}
+              />
+            )}
+            <span className="relative z-10">{f === "all" ? "Tất cả" : STATUS_CONFIG[f].label}</span>
+          </button>
+        ))}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="bg-white rounded-xl p-8 text-center text-[13px] text-gray-400 shadow-sm">
+          <FileSignature className="w-8 h-8 text-gray-200 mx-auto mb-2" />
+          Không có hợp đồng nào
+        </div>
+      ) : (
+        filtered.map((tx) => {
+          const status = tx.contract_status || "pending";
+          const sc = STATUS_CONFIG[status];
+          return (
+            <div key={tx.id} className="bg-white rounded-xl p-4 shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-[13px] font-bold text-black">{tx.project_title}</p>
+                  <p className="text-[10px] text-gray-400">
+                    {new Date(tx.created_date).toLocaleString("vi-VN")}
+                  </p>
+                </div>
+                <span className={`text-[9px] font-semibold px-2 py-0.5 rounded-full ${sc.color} shrink-0`}>
+                  {sc.label}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 mt-3 text-[11px]">
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Số tiền</span>
+                  <span className="font-bold text-black">{fmt(tx.amount)} VNĐ</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Phương thức</span>
+                  <span className="font-medium text-black">{tx.method || "—"}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Lãi suất toàn kỳ</span>
+                  <span className="font-medium text-black">{Number(tx.rate ?? 0).toFixed(2)}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Tổng nhận</span>
+                  <span className="font-bold text-[#948154]">{fmt(tx.total)} VNĐ</span>
+                </div>
+                {tx.payout_model === "DAILY_ACCRUAL" && (
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Lãi suất/ngày</span>
+                    <span className="font-medium text-black">{formatDailyRatePercent(tx.rate, tx.duration_days)}</span>
+                  </div>
+                )}
+              </div>
+
+              {tx.signature_content && (
+                <div className="flex items-center gap-2 mt-3 pt-3 border-t border-gray-100">
+                  <span className="text-[9px] text-gray-400 shrink-0">Chữ ký:</span>
+                  <div className="h-10 flex items-center">
+                    {tx.signature_type === "draw" ? (
+                      <img src={tx.signature_content} alt="sig" className="h-10 object-contain" />
+                    ) : (
+                      <span style={{ fontFamily: "'Great Vibes', cursive" }} className="text-[18px] text-[#16100b]">
+                        {tx.signature_content}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {status === "pending" && (
+                <div className="flex gap-2 mt-3 pt-3 border-t border-gray-100">
+                  <button
+                    onClick={() => handleAction(tx, "approved")}
+                    disabled={processingId === tx.id}
+                    className="flex-1 py-2 rounded-lg bg-green-500 hover:bg-green-600 text-white text-[11px] font-semibold flex items-center justify-center gap-1 disabled:opacity-50"
+                  >
+                    <Check className="w-3.5 h-3.5" /> Duyệt
+                  </button>
+                  <button
+                    onClick={() => handleAction(tx, "rejected")}
+                    disabled={processingId === tx.id}
+                    className="flex-1 py-2 rounded-lg bg-red-50 hover:bg-red-100 text-red-500 text-[11px] font-semibold flex items-center justify-center gap-1 disabled:opacity-50"
+                  >
+                    <X className="w-3.5 h-3.5" /> Từ chối
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}

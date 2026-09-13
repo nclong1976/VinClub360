@@ -1,0 +1,363 @@
+import React, { useState, useEffect } from "react";
+import { motion } from "framer-motion";
+import { Sliders, Dices, Flame, RefreshCw, Power, Award, Sparkles } from "lucide-react";
+import { getCasinoConfig, saveCasinoConfig, refreshCasinoConfig } from "@/lib/casinoConfig";
+import { getCasinoSecureConfig, updateCasinoSecureConfig, subscribeCasinoMaintenanceConfig } from "@/lib/supabaseDb";
+import { toast } from "sonner";
+
+const SPECIAL_GAMES = ["tiger-baccarat", "baccarat-long-ho"];
+
+export default function CasinoTab() {
+  const [config, setConfig] = useState(getCasinoConfig);
+  const [selectedSpecialGame, setSelectedSpecialGame] = useState("tiger-baccarat"); // 'tiger-baccarat' | 'baccarat-long-ho'
+
+  // Nguồn sự thật THẬT cho forced_outcome/odds205 - bảng Postgres
+  // casino_secure_config, được RPC resolve_tiger_baccarat_round đọc trực
+  // tiếp để tính tiền thắng. Tách khỏi "config" ở trên (vẫn dùng cho bảo
+  // trì/minBet/maxBet/thống kê - những phần không ảnh hưởng trực tiếp tới
+  // số tiền thắng nên chưa cần chuyển sang Postgres).
+  const [secureConfig, setSecureConfig] = useState({});
+
+  const fetchSecureConfig = async () => {
+    const entries = await Promise.all(
+      SPECIAL_GAMES.map(async (slug) => [slug, await getCasinoSecureConfig(slug)])
+    );
+    setSecureConfig(Object.fromEntries(entries.filter(([, v]) => v)));
+  };
+
+  useEffect(() => {
+    fetchSecureConfig();
+  }, []);
+
+  useEffect(() => {
+    const handleUpdate = (e) => {
+      setConfig(e?.detail || getCasinoConfig());
+    };
+
+    // Lắng nghe cả Supabase Realtime (đổi từ ván chơi thật của người dùng -
+    // vd tự động reset "forcedOutcome" về "auto" sau khi áp dụng xong 1
+    // ván, hoặc từ tab admin khác) lẫn sự kiện cùng tab và "storage" -
+    // trước đây chỉ nghe CustomEvent cùng tab nên 2 tab admin mở song song
+    // có thể ghi đè ngược lại thay đổi của nhau mà không hay biết.
+    const unsubRealtime = subscribeCasinoMaintenanceConfig(() => {
+      refreshCasinoConfig();
+    });
+
+    window.addEventListener("vinclub:casino_config_updated", handleUpdate);
+    window.addEventListener("storage", handleUpdate);
+    return () => {
+      if (typeof unsubRealtime === "function") unsubRealtime();
+      window.removeEventListener("vinclub:casino_config_updated", handleUpdate);
+      window.removeEventListener("storage", handleUpdate);
+    };
+  }, []);
+
+  const handleToggleGameMaintenance = (gameKey) => {
+    const currentGame = config.games[gameKey] || {};
+    const nextVal = !currentGame.isMaintenance;
+    const updatedGames = {
+      ...config.games,
+      [gameKey]: { ...currentGame, isMaintenance: nextVal },
+    };
+    const newCfg = { ...config, games: updatedGames };
+    setConfig(newCfg);
+    saveCasinoConfig(newCfg);
+
+    toast.info(`Đã ${nextVal ? "TẮT (BẢO TRÌ)" : "BẬT (MỞ HOẠT ĐỘNG)"} trò chơi: ${currentGame.name || gameKey}`);
+  };
+
+  const handleUpdateSpecialGameSetting = (gameKey, field, value) => {
+    const current = config.games[gameKey] || {};
+    const updatedGames = {
+      ...config.games,
+      [gameKey]: { ...current, [field]: value },
+    };
+    const newCfg = { ...config, games: updatedGames };
+    setConfig(newCfg);
+    saveCasinoConfig(newCfg);
+    toast.success(`Đã cập nhật ${field} cho trò chơi ${current.name || gameKey}`);
+  };
+
+  // Ép kết quả giờ ghi thẳng vào casino_secure_config trên Postgres - đây
+  // là bảng RPC resolve_tiger_baccarat_round thật sự đọc để tính tiền
+  // thắng, KHÔNG còn ghi vào casino_maintenance_config/localStorage cũ nữa
+  // (client người chơi không cần và không nên đọc được field này trước
+  // khi ván bài diễn ra).
+  // Vẫn bắt buộc xác nhận vì tác động trực tiếp tới tiền thật ngay ván tiếp
+  // theo (đặc biệt mức "Ép TIGER" trả 40:1).
+  const handleUpdateForcedOutcome = async (gameKey, value) => {
+    const current = config.games[gameKey] || {};
+
+    if (value !== "auto") {
+      const OUTCOME_LABELS = {
+        player: "PLAYER thắng",
+        banker: "BANKER thắng",
+        tie: "HÒA (8:1)",
+        tiger: "TIGER thắng (40:1)",
+      };
+      const confirmed = window.confirm(
+        `Xác nhận ÉP KẾT QUẢ "${OUTCOME_LABELS[value] || value}" cho ${current.name || gameKey}?\n\n` +
+        `Thao tác này áp dụng cho ĐÚNG 1 ván tiếp theo của bàn cược thật rồi tự động trở về "Tự động" - không cần tắt tay sau đó.`
+      );
+      if (!confirmed) return;
+    }
+
+    const result = await updateCasinoSecureConfig(gameKey, { forced_outcome: value });
+    if (!result) {
+      toast.error("Không thể cập nhật - vui lòng thử lại.");
+      return;
+    }
+    setSecureConfig((prev) => ({ ...prev, [gameKey]: result }));
+    toast.success(`Đã cập nhật ép kết quả cho ${current.name || gameKey}`);
+  };
+
+  const handleToggleOdds205 = async (gameKey) => {
+    const current = config.games[gameKey] || {};
+    // nextVal tính từ secureConfig (nguồn sự thật) chứ không phải config cũ
+    // - tránh trường hợp 2 bảng lệch nhau khiến bấm nút không đảo đúng chiều.
+    const nextVal = !(secureConfig[gameKey]?.odds205);
+
+    if (nextVal) {
+      const confirmed = window.confirm(
+        `Xác nhận BẬT tỷ lệ trả thưởng 1.1x cho ${current.name || gameKey}?\n\n` +
+        `Thao tác này áp dụng NGAY LẬP TỨC cho bàn cược thật: mọi ván tiếp theo sẽ luôn ra kết quả PLAYER hoặc BANKER (không Hòa) và trả thưởng thật 1.1x cho khách đang chơi.`
+      );
+      if (!confirmed) return;
+    }
+
+    // Ghi vào casino_secure_config (nguồn sự thật cho RPC tính tiền) TRƯỚC -
+    // nếu thất bại thì dừng lại luôn, không ghi tiếp vào bảng hiển thị cũ
+    // để tránh 2 nơi lệch nhau.
+    const secureResult = await updateCasinoSecureConfig(gameKey, { odds205: nextVal });
+    if (!secureResult) {
+      toast.error("Không thể cập nhật - vui lòng thử lại.");
+      return;
+    }
+    setSecureConfig((prev) => ({ ...prev, [gameKey]: secureResult }));
+
+    // Vẫn ghi vào casino_maintenance_config CHỈ để bảng cược của
+    // người chơi hiển thị đúng tỷ lệ "1.1x" đang áp dụng - không còn dùng
+    // để tính tiền thắng nữa (đã chuyển hẳn sang casino_secure_config).
+    const updatedGames = {
+      ...config.games,
+      [gameKey]: {
+        ...current,
+        odds205: nextVal,
+        forcedOutcome: nextVal ? "auto" : (current.forcedOutcome || "auto")
+      },
+    };
+    const newCfg = { ...config, games: updatedGames };
+    setConfig(newCfg);
+    saveCasinoConfig(newCfg);
+
+    if (nextVal) {
+      toast.success(`ĐÃ BẬT TÍNH NĂNG: Kết quả bàn cược tự động trả về PLAYER & BANKER (1.1x) cho ${current.name || gameKey}!`);
+    } else {
+      toast.info(`Đã TẮT tính năng (Trở về chuẩn 50/50 & Hòa) cho ${current.name || gameKey}`);
+    }
+  };
+
+  const activeSpecialGameData = config.games[selectedSpecialGame] || {};
+  const activeSecureConfig = secureConfig[selectedSpecialGame] || {};
+
+  return (
+    <div className="space-y-4 font-heading">
+      {/* Banner Top Header */}
+      <div className="bg-gradient-to-r from-amber-950 via-yellow-950 to-slate-900 p-4 rounded-2xl border-2 border-[#d4af37]/50 text-white shadow-xl relative overflow-hidden">
+        <div className="relative z-10 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-black tracking-wide text-[#e8c87a] uppercase flex items-center gap-2">
+              <Dices className="w-5 h-5 text-yellow-400" />
+              QUẢN LÝ BẢO TRÌ & ĐIỀU HÀNH CASINO CORONA
+            </h2>
+            <p className="text-[11px] text-amber-200/80 mt-0.5">
+              Hệ thống quản lý trung tâm toàn bộ 12 phòng chơi, thiết lập bảo trì và điều khiển 2 game đặc biệt
+            </p>
+          </div>
+
+          {/* Quick Refresh */}
+          <button
+            onClick={() => setConfig(getCasinoConfig())}
+            className="px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-amber-200 text-xs font-bold flex items-center gap-1 transition-all cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> Đồng bộ cấu hình
+          </button>
+        </div>
+      </div>
+
+      {/* SPECIAL MANAGEMENT AREA FOR TIGER BACCARAT & BACCARAT LONG HỔ */}
+      <div className="bg-gradient-to-b from-[#1a1711] via-[#12100b] to-[#0a0906] p-4 rounded-2xl border-2 border-[#d4af37] text-white shadow-2xl space-y-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 border-b border-[#d4af37]/30 pb-3">
+          <div className="flex items-center gap-2">
+            <Flame className="w-5 h-5 text-amber-400 animate-bounce" />
+            <div>
+              <h3 className="text-sm font-black text-[#f2ca50] uppercase tracking-wider">
+                QUẢN LÝ CAO CẤP: TIGER BACCARAT & BACCARAT LONG HỔ
+              </h3>
+              <p className="text-[10px] text-gray-400">
+                Can thiệp kết quả ván cược, điều chỉnh mức cược min/max & kiểm soát tỷ lệ thắng
+              </p>
+            </div>
+          </div>
+
+          {/* Game Switch Buttons - khối nền trượt mượt (layoutId) khi chuyển
+              game, đồng nhất với cách Admin.jsx/MemberHubTab.jsx đang làm. */}
+          <div className="flex bg-black/60 p-1 rounded-xl border border-[#d4af37]/40 w-full sm:w-auto">
+            {[
+              { id: "tiger-baccarat", label: "Tiger Baccarat" },
+              { id: "baccarat-long-ho", label: "Baccarat Long Hổ" },
+            ].map((g) => (
+              <button
+                key={g.id}
+                onClick={() => setSelectedSpecialGame(g.id)}
+                className={`relative flex-1 sm:flex-initial px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                  selectedSpecialGame === g.id ? "text-black font-black" : "text-gray-400 hover:text-white"
+                }`}
+              >
+                {selectedSpecialGame === g.id && (
+                  <motion.span
+                    layoutId="casino-special-game-active-bg"
+                    className="absolute inset-0 bg-[#d4af37] rounded-lg shadow-md"
+                    transition={{ type: "spring", duration: 0.35, bounce: 0.15 }}
+                  />
+                )}
+                <span className="relative z-10">{g.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Selected Game Dashboard Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Left Column: Forced Outcome & Game Status */}
+          <div className="bg-black/40 p-3.5 rounded-xl border border-[#d4af37]/30 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-[#e8c87a] uppercase flex items-center gap-1.5">
+                <Sliders className="w-4 h-4 text-amber-400" /> Trạng Thái & Điều Khiển Kết Quả
+              </span>
+              <button
+                onClick={() => handleToggleGameMaintenance(selectedSpecialGame)}
+                className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase transition-all ${
+                  activeSpecialGameData.isMaintenance
+                    ? "bg-red-600 text-white"
+                    : "bg-emerald-600 text-white"
+                }`}
+              >
+                {activeSpecialGameData.isMaintenance ? "ĐANG BẢO TRÌ" : "HOẠT ĐỘNG"}
+              </button>
+            </div>
+
+            {/* Forced Outcome Selector */}
+            <div>
+              <label className="text-[11px] text-gray-300 font-bold flex items-center gap-1 mb-1">
+                <Sliders className="w-3.5 h-3.5 text-amber-400" /> Can thiệp kết quả ván tiếp theo (Forced Result):
+              </label>
+              <select
+                value={activeSecureConfig.forced_outcome || "auto"}
+                onChange={(e) =>
+                  handleUpdateForcedOutcome(selectedSpecialGame, e.target.value)
+                }
+                className="w-full bg-[#1c1913] border border-[#d4af37]/60 rounded-xl px-3 py-2 text-xs font-bold text-amber-300 focus:outline-none focus:border-amber-400"
+              >
+                <option value="auto">Tự động (Ngẫu nhiên chuẩn 50/50)</option>
+                <option value="player">Ép PLAYER Thắng (Thẻ xanh điểm cao hơn)</option>
+                <option value="banker">Ép BANKER Thắng (Thẻ đỏ điểm cao hơn)</option>
+                <option value="tie">Ép HÒA (Tie - Lợi nhuận 8:1)</option>
+                <option value="tiger">Ép TIGER Thắng (Thần Hổ 40:1)</option>
+              </select>
+              <p className="text-[9.5px] text-gray-400 mt-1 italic">
+                * Khi chọn ép kết quả, ván bài tiếp theo lật ra sẽ chắc chắn trả về kết quả đã định sẵn, sau đó tự động trở về "Tự động".
+              </p>
+            </div>
+
+            {/* 2.05 PAYOUT ODDS TOGGLE CONTROL */}
+            <div className="pt-2 border-t border-[#d4af37]/20">
+              <div className="flex items-center justify-between bg-gradient-to-r from-amber-950/80 via-yellow-950/50 to-black p-3 rounded-xl border border-amber-500/60 shadow-md">
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-amber-400 animate-pulse" />
+                    <span className="text-xs font-black text-amber-300 uppercase tracking-wide">
+                      Kết quả Player & Banker (Trả thưởng 1.1x — Không Hòa)
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-gray-300 mt-0.5">
+                    Tự động đưa kết quả về <strong className="text-yellow-400 font-extrabold">PLAYER hoặc BANKER</strong>, tỷ lệ trả thưởng <strong className="text-yellow-400 font-extrabold">1.1x</strong> (cược 1,000 → lời 1,100). Kết quả Hòa sẽ không xuất hiện.
+                  </p>
+                </div>
+
+                <button
+                  onClick={() => handleToggleOdds205(selectedSpecialGame)}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-black uppercase tracking-wider flex items-center gap-1.5 transition-all cursor-pointer shrink-0 shadow-lg ${
+                    activeSecureConfig.odds205
+                      ? "bg-gradient-to-r from-amber-400 via-yellow-400 to-amber-500 text-black ring-2 ring-yellow-300 shadow-amber-500/50 scale-105"
+                      : "bg-gray-800 text-gray-400 border border-gray-600 hover:bg-gray-700 hover:text-white"
+                  }`}
+                >
+                  <Power className="w-3.5 h-3.5" />
+                  {activeSecureConfig.odds205 ? "BẬT (1.1x — Không Hòa)" : "TẮT (Chuẩn)"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Right Column: Bet Limits & Revenue Stats */}
+          <div className="bg-black/40 p-3.5 rounded-xl border border-[#d4af37]/30 space-y-3">
+            <span className="text-xs font-bold text-[#e8c87a] uppercase flex items-center gap-1.5">
+              <Award className="w-4 h-4 text-amber-400" /> Hạn Mức Cược & Thống Kê Phòng
+            </span>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-[10px] font-bold text-gray-400 block mb-0.5">Cược tối thiểu (₫):</label>
+                <input
+                  type="number"
+                  value={activeSpecialGameData.minBet || 10000}
+                  onChange={(e) =>
+                    handleUpdateSpecialGameSetting(selectedSpecialGame, "minBet", parseInt(e.target.value))
+                  }
+                  className="w-full bg-[#1c1913] border border-gray-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono font-bold"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-bold text-gray-400 block mb-0.5">Cược tối đa (₫):</label>
+                <input
+                  type="number"
+                  value={activeSpecialGameData.maxBet || 500000000}
+                  onChange={(e) =>
+                    handleUpdateSpecialGameSetting(selectedSpecialGame, "maxBet", parseInt(e.target.value))
+                  }
+                  className="w-full bg-[#1c1913] border border-gray-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono font-bold"
+                />
+              </div>
+            </div>
+
+            {/* Revenue Statistics Box */}
+            <div className="bg-white/5 p-2.5 rounded-xl border border-white/10 space-y-1 text-xs">
+              <div className="flex justify-between">
+                <span className="text-gray-400">Tổng tiền cược tiếp nhận:</span>
+                <span className="font-mono text-emerald-400 font-bold">
+                  {new Intl.NumberFormat("vi-VN").format(activeSpecialGameData.totalBets || 0)} ₫
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-400">Tổng tiền đã trả thưởng:</span>
+                <span className="font-mono text-amber-400 font-bold">
+                  {new Intl.NumberFormat("vi-VN").format(activeSpecialGameData.totalPayout || 0)} ₫
+                </span>
+              </div>
+              <div className="flex justify-between border-t border-white/10 pt-1 font-bold">
+                <span className="text-amber-200">Lợi nhuận Casino:</span>
+                <span className="font-mono text-yellow-400">
+                  {new Intl.NumberFormat("vi-VN").format(
+                    (activeSpecialGameData.totalBets || 0) - (activeSpecialGameData.totalPayout || 0)
+                  )}{" "}
+                  ₫
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
